@@ -1,0 +1,32 @@
+# http://www.gnu.org/software/automake
+
+Makefile.in
+Makefile
+
+# http://www.gnu.org/software/autoconf
+
+/autom4te.cache
+/autoscan.log
+/autoscan-*.log
+/aclocal.m4
+/compile
+/config.h
+/config.log
+/config.status
+/config.h.in
+/configure
+/configure.scan
+/depcomp
+/install-sh
+/missing
+/stamp-h1
+/build-aux
+.deps
+
+# http://www.gnu.org/software/libtool
+/libtool
+.deps/
+.dirstamp
+.libs/
+*.l[ao]
+*~
