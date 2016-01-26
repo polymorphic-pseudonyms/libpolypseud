@@ -30,3 +30,4 @@ Makefile
 .libs/
 *.l[ao]
 *~
+*.o
