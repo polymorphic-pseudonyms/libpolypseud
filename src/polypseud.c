@@ -65,16 +65,45 @@ void pseudonym_free(pseudonym *pseud) {
     free(pseud);
 }
 
-EC_POINT *decode_base64_point(const EC_GROUP *ec_group, char *string, BN_CTX *bn_ctx) {
+polypseud_ctx *polypseud_ctx_new() {
+    polypseud_ctx *ctx = (polypseud_ctx*)malloc(sizeof(polypseud_ctx));
+    ctx->bn_ctx = BN_CTX_new();
+    ctx->p = BN_new();
+    ctx->a = BN_new();
+    ctx->b = BN_new();
+    BN_hex2bn(&ctx->p, "D35E472036BC4FB7E13C785ED201E065F98FCFA6F6F40DEF4F92B9EC7893EC28FCD412B1F1B32E27");
+    BN_hex2bn(&ctx->a, "3EE30B568FBAB0F883CCEBD46D3F3BB8A2A73513F5EB79DA66190EB085FFA9F492F375A97D860EB4");
+    BN_hex2bn(&ctx->b, "520883949DFDBC42D3AD198640688A6FE13F41349554B49ACC31DCCD884539816F5EB4AC8FB1F1A6");
+    ctx->ec_group = EC_GROUP_new_curve_GFp(ctx->p, ctx->a, ctx->b, ctx->bn_ctx);
+    if(ctx->ec_group == NULL) {
+        BN_free(ctx->p);
+        BN_free(ctx->a);
+        BN_free(ctx->b);
+        BN_CTX_free(ctx->bn_ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+void polypseud_ctx_free(polypseud_ctx *ctx) {
+    EC_GROUP_free(ctx->ec_group);
+    BN_free(ctx->p);
+    BN_free(ctx->a);
+    BN_free(ctx->b);
+    BN_CTX_free(ctx->bn_ctx);
+    free(ctx);
+}
+
+EC_POINT *decode_base64_point(const polypseud_ctx *ctx, char *string) {
     unsigned char *bytes;
     size_t length;
 
     if(Base64Decode(string, &bytes, &length) != 0)
         return NULL;
 
-    EC_POINT *point = EC_POINT_new(ec_group);
+    EC_POINT *point = EC_POINT_new(ctx->ec_group);
 
-    EC_POINT_oct2point(ec_group, point, bytes, length, bn_ctx);
+    EC_POINT_oct2point(ctx->ec_group, point, bytes, length, ctx->bn_ctx);
 
     free(bytes);
 
@@ -106,7 +135,7 @@ unsigned int hash(unsigned char *message, size_t message_len, unsigned char **di
     return digest_len;
 }
 
-pseudonym *decode(const EC_GROUP *ec_group, const char *pseudonym_string, BN_CTX *bn_ctx) {
+pseudonym *decode(const polypseud_ctx *ctx, const char *pseudonym_string) {
     char pseud_str[strlen(pseudonym_string)+1];
     strcpy(pseud_str, pseudonym_string);
 
@@ -118,49 +147,40 @@ pseudonym *decode(const EC_GROUP *ec_group, const char *pseudonym_string, BN_CTX
     }
     pseudonym *pseud = (pseudonym*)malloc(sizeof(pseudonym));
 
-    pseud->a = decode_base64_point(ec_group, partA, bn_ctx);
-    pseud->b = decode_base64_point(ec_group, partB, bn_ctx);
-    pseud->c = decode_base64_point(ec_group, partC, bn_ctx);
+    pseud->a = decode_base64_point(ctx, partA);
+    pseud->b = decode_base64_point(ctx, partB);
+    pseud->c = decode_base64_point(ctx, partC);
 
     return pseud;
 }
 
-size_t decrypt(const EC_GROUP *ec_group, pseudonym* ep, const BIGNUM *privkey, const BIGNUM *closingkey, unsigned char **pp, BN_CTX *bn_ctx) {
-   if(EC_POINT_mul(ec_group, ep->a, NULL, ep->a, privkey, bn_ctx) == 0) 
+size_t decrypt(const polypseud_ctx *ctx, pseudonym* ep, const BIGNUM *privkey, const BIGNUM *closingkey, unsigned char **pp) {
+   if(EC_POINT_mul(ctx->ec_group, ep->a, NULL, ep->a, privkey, ctx->bn_ctx) == 0) 
        return 0;
    
-   if(EC_POINT_invert(ec_group, ep->a, bn_ctx) == 0) 
+   if(EC_POINT_invert(ctx->ec_group, ep->a, ctx->bn_ctx) == 0) 
         return 0;
 
-   if(EC_POINT_add(ec_group, ep->a, ep->b, ep->a, bn_ctx) == 0)
+   if(EC_POINT_add(ctx->ec_group, ep->a, ep->b, ep->a, ctx->bn_ctx) == 0)
        return 0;
 
-   if(EC_POINT_mul(ec_group, ep->a, NULL, ep->a, closingkey, bn_ctx) == 0) 
+   if(EC_POINT_mul(ctx->ec_group, ep->a, NULL, ep->a, closingkey, ctx->bn_ctx) == 0) 
        return 0;
    
    unsigned char octstring[100];
 
-   size_t len = EC_POINT_point2oct(ec_group, ep->a, POINT_CONVERSION_UNCOMPRESSED, octstring, 100, bn_ctx);
+   size_t len = EC_POINT_point2oct(ctx->ec_group, ep->a, POINT_CONVERSION_UNCOMPRESSED, octstring, 100, ctx->bn_ctx);
    
    return hash(octstring, len, pp); 
 }
 
 char* decrypt_ep(const char* ep, const char* privkey, const char* closingkey) {
-    BN_CTX *bn_ctx = BN_CTX_new();
-    //EC_GROUP *ec_group = EC_GROUP_new_by_curve_name(NID_brainpoolP320r1);
-    
-    BIGNUM *bn_p = BN_new();
-    BIGNUM *bn_a = BN_new();
-    BIGNUM *bn_b = BN_new();
-    BN_hex2bn(&bn_p, "D35E472036BC4FB7E13C785ED201E065F98FCFA6F6F40DEF4F92B9EC7893EC28FCD412B1F1B32E27");
-    BN_hex2bn(&bn_a, "3EE30B568FBAB0F883CCEBD46D3F3BB8A2A73513F5EB79DA66190EB085FFA9F492F375A97D860EB4");
-    BN_hex2bn(&bn_b, "520883949DFDBC42D3AD198640688A6FE13F41349554B49ACC31DCCD884539816F5EB4AC8FB1F1A6");
-    EC_GROUP *ec_group = EC_GROUP_new_curve_GFp(bn_p, bn_a, bn_b, bn_ctx);
-    if(ec_group == NULL) {
+    polypseud_ctx *ctx = polypseud_ctx_new();
+    if(ctx == NULL) {
         return NULL;
     }
 
-    pseudonym *pseudonym = decode(ec_group, ep, bn_ctx);
+    pseudonym *pseudonym = decode(ctx, ep);
 
     BIGNUM *bn_privkey = BN_new();
     BIGNUM *bn_closingkey = BN_new();
@@ -168,7 +188,9 @@ char* decrypt_ep(const char* ep, const char* privkey, const char* closingkey) {
     BN_hex2bn(&bn_closingkey, closingkey);
     
     unsigned char *pp;
-    size_t len = decrypt(ec_group, pseudonym, bn_privkey, bn_closingkey, &pp, bn_ctx);
+    size_t len = decrypt(ctx, pseudonym, bn_privkey, bn_closingkey, &pp);
+    BN_clear_free(bn_closingkey);
+    BN_clear_free(bn_privkey);
 
     if(len == 0) {
         return NULL;
@@ -178,10 +200,7 @@ char* decrypt_ep(const char* ep, const char* privkey, const char* closingkey) {
     Base64Encode(pp, len, &base64);
     
     free(pp);
-    BN_clear_free(bn_closingkey);
-    BN_clear_free(bn_privkey);
     pseudonym_free(pseudonym);
-    BN_CTX_free(bn_ctx);
-    EC_GROUP_free(ec_group);
+    polypseud_ctx_free(ctx);
     return base64;
 }
