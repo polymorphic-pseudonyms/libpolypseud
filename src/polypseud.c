@@ -5,6 +5,7 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
+#include <openssl/hmac.h>
 #include <assert.h>
 
 //Base64 functions taken and adapted from https://gist.github.com/barrysteyn/7308212
@@ -149,7 +150,7 @@ unsigned int hash(unsigned char *message, size_t message_len, unsigned char **di
     if(1 != EVP_DigestUpdate(mdctx, message, message_len))
         return 0;
 
-    if((*digest = (unsigned char *)OPENSSL_malloc(EVP_MD_size(EVP_sha256()))) == NULL)
+    if((*digest = (unsigned char *)malloc(EVP_MD_size(EVP_sha256()))) == NULL)
         return 0;
 
     unsigned int digest_len;
@@ -159,6 +160,15 @@ unsigned int hash(unsigned char *message, size_t message_len, unsigned char **di
     EVP_MD_CTX_destroy(mdctx);
 
     return digest_len;
+}
+
+unsigned char *KDF(unsigned char *k, int k_len, unsigned char *data, int data_len, unsigned int *out_len) {
+    unsigned char *out = (unsigned char*)malloc(EVP_MD_size(EVP_sha256()));
+    if(out == NULL) {
+        return NULL;
+    }
+
+    return HMAC(EVP_sha256(), k, k_len, data, data_len, out, out_len); 
 }
 
 pseudonym *pseudonym_decode(const polypseud_ctx *ctx, const char *pseudonym_string) {
@@ -180,7 +190,7 @@ pseudonym *pseudonym_decode(const polypseud_ctx *ctx, const char *pseudonym_stri
     return pseud;
 }
 
-char* pseudonym_encode(const polypseud_ctx *ctx, const pseudonym *pseud) {
+char *pseudonym_encode(const polypseud_ctx *ctx, const pseudonym *pseud) {
     char *partA = encode_base64_point(ctx, pseud->a);
     char *partB = encode_base64_point(ctx, pseud->b);
     char *partC = encode_base64_point(ctx, pseud->c);
@@ -199,7 +209,11 @@ char* pseudonym_encode(const polypseud_ctx *ctx, const pseudonym *pseud) {
     return encoded;
 }
 
-size_t polypseud_decrypt(const polypseud_ctx *ctx, pseudonym* ep, const BIGNUM *privkey, const BIGNUM *closingkey, unsigned char **pp) {
+void printPoint(const polypseud_ctx *ctx, EC_POINT *point) {
+    printf("%s\n", EC_POINT_point2hex(ctx->ec_group, point, POINT_CONVERSION_UNCOMPRESSED, ctx->bn_ctx));
+}
+
+size_t polypseud_decrypt(const polypseud_ctx *ctx, pseudonym *ep, const BIGNUM *privkey, const BIGNUM *closingkey, unsigned char **pp) {
    if(EC_POINT_mul(ctx->ec_group, ep->a, NULL, ep->a, privkey, ctx->bn_ctx) == 0) 
        return 0;
    
@@ -235,10 +249,6 @@ char *polypseud_decrypt_ep(const char *ep, char *privkey, char *closingkey) {
     BIGNUM *bn_closingkey = BN_bin2bn(bin_closingkey, len_closingkey, NULL);
     free(bin_privkey);
     free(bin_closingkey);
-    /*BIGNUM *bn_privkey = BN_new();
-    BIGNUM *bn_closingkey = BN_new();
-    BN_hex2bn(&bn_privkey, privkey);
-    BN_hex2bn(&bn_closingkey, closingkey);*/
     
     unsigned char *pp;
     size_t len = polypseud_decrypt(ctx, pseudonym, bn_privkey, bn_closingkey, &pp);
@@ -285,9 +295,6 @@ pseudonym *polypseud_encrypt(const polypseud_ctx *ctx, EC_POINT *yK, const char 
         return NULL;
     EC_POINT *point = embed(ctx, (unsigned char*)uid, strlen(uid));
     
-    char *hex = EC_POINT_point2hex(ctx->ec_group, point, POINT_CONVERSION_COMPRESSED, ctx->bn_ctx);
-    printf("embedded: %s\n", hex);
-
     pseudonym *pseud = (pseudonym*)malloc(sizeof(pseudonym));
     pseud->a = EC_POINT_new(ctx->ec_group);
     pseud->b = EC_POINT_new(ctx->ec_group);
@@ -307,10 +314,96 @@ char* polypseud_generate_pp(char *yK, const char *uid) {
     EC_POINT *yK_point = decode_base64_point(ctx, yK);
     pseudonym *pseud=polypseud_encrypt(ctx, yK_point, uid);
     
-    char* encoded = pseudonym_encode(ctx, pseud);
+    char *encoded = pseudonym_encode(ctx, pseud);
 
     pseudonym_free(pseud);
     EC_POINT_free(yK_point);
+    polypseud_ctx_free(ctx);
+
+    return encoded;
+}
+
+pseudonym *polypseud_randomize(const polypseud_ctx *ctx, pseudonym *pseud) {
+    BIGNUM *l = BN_new();
+    if(BN_rand_range(l, ctx->p) == 0)
+        return NULL;
+    EC_POINT *t = EC_POINT_new(ctx->ec_group);
+    EC_POINT_mul(ctx->ec_group, t, NULL, ctx->g, l, ctx->bn_ctx);
+    EC_POINT_add(ctx->ec_group, pseud->a, pseud->a, t, ctx->bn_ctx);
+
+    EC_POINT_mul(ctx->ec_group, t, NULL, pseud->c, l, ctx->bn_ctx);
+    EC_POINT_add(ctx->ec_group, pseud->b, pseud->b, t, ctx->bn_ctx);
+    
+    EC_POINT_free(t);
+    return pseud;
+}
+
+char *polypseud_randomize_enc(char *pseud) {
+    polypseud_ctx *ctx = polypseud_ctx_new();
+    pseudonym *decoded = pseudonym_decode(ctx, pseud);
+    if(polypseud_randomize(ctx, decoded) == NULL)
+        return NULL;
+    char *encoded = pseudonym_encode(ctx, decoded);
+    pseudonym_free(decoded);
+    polypseud_ctx_free(ctx);
+    return encoded;
+}
+
+pseudonym *polypseud_specialize(const polypseud_ctx *ctx, pseudonym *pseud, char *spid, unsigned char *Dp, int Dp_len, unsigned char *Dk, int Dk_len) {
+    unsigned int kdf_dp_len;
+    unsigned char *kdf_dp_arr = KDF(Dp, Dp_len, (unsigned char *)spid, strlen(spid), &kdf_dp_len);
+    if(kdf_dp_arr == NULL)
+        return NULL;
+    BIGNUM *kdf_dp = BN_bin2bn(kdf_dp_arr, kdf_dp_len, NULL);
+    unsigned int kdf_dk_len;
+    unsigned char *kdf_dk_arr = KDF(Dk, Dk_len, (unsigned char *)spid, strlen(spid), &kdf_dk_len);
+    if(kdf_dk_arr == NULL)
+        return NULL;
+    BIGNUM *kdf_dk = BN_bin2bn(kdf_dk_arr, kdf_dk_len, NULL);
+    BIGNUM *kdf_dk_inv = BN_mod_inverse(NULL, kdf_dk, ctx->q, ctx->bn_ctx);
+
+    EC_POINT_mul(ctx->ec_group, pseud->a, NULL, pseud->a, kdf_dp, ctx->bn_ctx);
+    EC_POINT_mul(ctx->ec_group, pseud->b, NULL, pseud->b, kdf_dp, ctx->bn_ctx);
+
+    EC_POINT_mul(ctx->ec_group, pseud->a, NULL, pseud->a, kdf_dk, ctx->bn_ctx);
+    EC_POINT_mul(ctx->ec_group, pseud->c, NULL, pseud->c, kdf_dk_inv, ctx->bn_ctx);
+
+    if(polypseud_randomize(ctx, pseud) == NULL)
+        return NULL;
+
+    BN_free(kdf_dk_inv);
+    BN_free(kdf_dk);
+    free(kdf_dk_arr);
+    BN_free(kdf_dp);
+    free(kdf_dp_arr);
+
+    return pseud;
+}
+
+char *polypseud_specialize_pp(char *pp, char *spid, char *Dp, char *Dk) {
+    polypseud_ctx *ctx = polypseud_ctx_new();
+
+    pseudonym *pseud = pseudonym_decode(ctx, pp);
+    int Dp_len = strlen(Dp) / 2;
+    int Dk_len = strlen(Dk) / 2;
+    unsigned char *Dp_arr = (unsigned char*)malloc(Dp_len);
+    unsigned char *Dk_arr = (unsigned char*)malloc(Dk_len);
+    for(int i = 0; i < Dp_len; i++) {
+        sscanf(Dp, "%2hhx", &Dp_arr[i]);
+        Dp += 2;
+    }
+    for(int i = 0; i < Dk_len; i++) {
+        sscanf(Dk, "%2hhx", &Dk_arr[i]);
+        Dk += 2;
+    }
+
+    if(polypseud_specialize(ctx, pseud, spid, Dp_arr, Dp_len, Dk_arr, Dk_len) == NULL)
+        return NULL;
+    char *encoded = pseudonym_encode(ctx, pseud);
+
+    free(Dk_arr);
+    free(Dp_arr);
+    pseudonym_free(pseud);
     polypseud_ctx_free(ctx);
 
     return encoded;
